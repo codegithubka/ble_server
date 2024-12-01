@@ -32,6 +32,7 @@ scan on
 hciconfig hci0
 
 """
+from peripheral_class import Peripheral
 from IMU import IMUSensor
 from bluezero import adapter
 from bluezero import advertisement
@@ -215,15 +216,16 @@ class IMUPeripheral:
             self.logger.error(f"Error starting peripheral: {e}", exc_info=True)
             raise
 
-        def stop(self):
-            """Stop the peripheral"""
-            try:
-                self.logger.info("Stopping IMU peripheral...")
-                self.running = False
-                self.ad_manager.unregister_advertisement(self.advertisement)
-                self.dongle.discoverable = False
-            except Exception as e:
-                self.logger.error(f"Error stopping peripheral: {e}")
+    def stop(self):
+        """Stop the peripheral"""
+        try:
+            self.logger.info("Stopping IMU peripheral...")
+            self.running = False
+            self.ad_manager.unregister_advertisement(self.advertisement)
+            self.dongle.discoverable = False
+        except Exception as e:
+            self.logger.error(f"Error stopping peripheral: {e}")
+
 
 if __name__ == '__main__':
     try:
