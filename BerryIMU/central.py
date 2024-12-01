@@ -1,170 +1,88 @@
-import dbus
-from bluezero import adapter
-from bluezero import localGATT
-from IMU import IMUSensor
-import struct
-import time
-import logging
+"""
+
+UUIDs
+
+- Central node uses the same UUID as defined in the peripheral
+- Characteristics UUIDs:
+    - Accelerometer: 2713d05a-1234-5678-1234-56789abcdef1
+    - Gyroscope: 2713d05b-1234-5678-1234-56789abcdef2
+    - Magnetometer: 2713d05c-1234-5678-1234-56789abcdef3
+
+central = CentralIMU(
+    device_addr="PERIPHERAL_MAC",
+    imu_srv_uuid="1b9998a2-1234-5678-1234-56789abcdef0",
+    imu_chrc_uuid={
+        'accel': '2713d05a-1234-5678-1234-56789abcdef1',
+        'gyro': '2713d05b-1234-5678-1234-56789abcdef2',
+        'mag': '2713d05c-1234-5678-1234-56789abcdef3'
+    }
+)
+
+"""
 
 
-class IMUPeripheral:
-    """BLE Peripheral that broadcasts IMU sensor data"""
 
-    # Service and characteristic UUIDs
-    IMU_SERVICE_UUID = '1b9998a2-e730-4d61-8d01-8c0f6a81ba0f'
-    ACCEL_CHAR_UUID = '2713d05a-6604-4d51-9f1e-aa4981a51d02'
-    GYRO_CHAR_UUID = '2713d05b-6604-4d51-9f1e-aa4981a51d02'
-    MAG_CHAR_UUID = '2713d05c-6604-4d51-9f1e-aa4981a51d02'
 
-    def __init__(self, adapter_addr=None, update_rate=0.1):
-        """
-        Initialize IMU Peripheral
+from time import sleep
+from bluezero import adapter, device, GATT, tools
 
-        :param adapter_addr: Optional specific adapter address
-        :param update_rate: Sensor update rate in seconds
-        """
-        self.logger = logging.getLogger(__name__)
-        logging.basicConfig(level=logging.INFO)
 
-        # Initialize BLE adapter
-        if adapter_addr:
-            self.dongle = adapter.Adapter(adapter_addr)
-        else:
+class CentralIMU:
+    """Central Node to read IMU values from a Peripheral."""
+
+    def __init__(self, device_addr, imu_srv_uuid, imu_chrc_uuid, adapter_addr=None):
+        if adapter_addr is None:
             self.dongle = adapter.Adapter()
+        else:
+            self.dongle = adapter.Adapter(adapter_addr)
 
         if not self.dongle.powered:
             self.dongle.powered = True
 
-        # Initialize IMU
-        self.imu = IMUSensor()
-        if self.imu.detectIMU() == 99:
-            raise RuntimeError("No IMU detected")
-        self.imu.initIMU()
+        self.rmt_device = device.Device(self.dongle.address, device_addr)
+        self.imu_service_uuid = imu_srv_uuid
+        self.imu_char_uuid = imu_chrc_uuid
+        self.imu_characteristic = None
 
-        # Create BLE application
-        self.app = localGATT.Application()
+    def connect_to_device(self, timeout=35):
+        """Connect to the peripheral device."""
+        print(f"Connecting to device {self.rmt_device.address}...")
+        self.rmt_device.connect(timeout=timeout)
 
-        # Create service
-        self.imu_service = self._setup_imu_service()
+        # Wait until services are resolved
+        while not self.rmt_device.services_resolved:
+            sleep(0.5)
 
-        # Store characteristics for updating
-        self.accel_char = None
-        self.gyro_char = None
-        self.mag_char = None
+        print("Connected and services resolved.")
+        self.load_imu_characteristic()
 
-        self.update_rate = update_rate
-        self.running = False
-
-    def _setup_imu_service(self):
-        """Setup IMU service with characteristics"""
-        # Create main service
-        service = localGATT.Service(0, self.IMU_SERVICE_UUID, True)
-        self.app.add_managed_object(service)
-
-        # Add characteristics
-        self.accel_char = self._add_characteristic(
-            service,
-            self.ACCEL_CHAR_UUID,
-            [0, 0, 0, 0, 0, 0],  # Space for 3 int16 values
-            notifying=True
+    def load_imu_characteristic(self):
+        """Load the IMU characteristic."""
+        print("Loading IMU characteristic...")
+        self.imu_characteristic = GATT.Characteristic(
+            adapter_addr=self.dongle.address,
+            device_addr=self.rmt_device.address,
+            srv_uuid=self.imu_service_uuid,
+            chrc_uuid=self.imu_char_uuid
         )
+        if self.imu_characteristic.resolve_gatt():
+            print(f"IMU characteristic loaded: {self.imu_char_uuid}")
+        else:
+            print("Failed to load IMU characteristic.")
 
-        self.gyro_char = self._add_characteristic(
-            service,
-            self.GYRO_CHAR_UUID,
-            [0, 0, 0, 0, 0, 0],
-            notifying=True
-        )
+    def read_imu_data(self):
+        """Read IMU data from the characteristic."""
+        if self.imu_characteristic:
+            raw_data = self.imu_characteristic.read_value()
+            imu_values = tools.bytes_to_xyz(raw_data)
+            print(f"IMU Data: X={imu_values[0]}, Y={imu_values[1]}, Z={imu_values[2]}")
+            return imu_values
+        else:
+            print("IMU characteristic not loaded.")
+            return None
 
-        self.mag_char = self._add_characteristic(
-            service,
-            self.MAG_CHAR_UUID,
-            [0, 0, 0, 0, 0, 0],
-            notifying=True
-        )
-
-        return service
-
-    def _add_characteristic(self, service, uuid, initial_value, notifying=False):
-        """Helper method to add a characteristic to a service"""
-        flags = ['read', 'notify']
-        char = localGATT.Characteristic(
-            service_id=0,
-            characteristic_id=len(getattr(service, 'characteristics', [])),
-            uuid=uuid,
-            value=initial_value,
-            notifying=notifying,
-            flags=flags
-        )
-
-        if not hasattr(service, 'characteristics'):
-            service.characteristics = []
-        service.characteristics.append(char)
-
-        self.app.add_managed_object(char)
-        return char
-
-    def _pack_sensor_values(self, x, y, z):
-        """Pack three sensor values into a bytearray"""
-        # Convert to bytearray, assuming int16 values
-        return list(struct.pack('<hhh', int(x), int(y), int(z)))
-
-    def update_sensor_values(self):
-        """Read and update all sensor values"""
-        try:
-            # Read accelerometer
-            acc_x = self.imu.readACCx()
-            acc_y = self.imu.readACCy()
-            acc_z = self.imu.readACCz()
-            self.accel_char.set_value(self._pack_sensor_values(acc_x, acc_y, acc_z))
-
-            # Read gyroscope
-            gyr_x = self.imu.readGYRx()
-            gyr_y = self.imu.readGYRy()
-            gyr_z = self.imu.readGYRz()
-            self.gyro_char.set_value(self._pack_sensor_values(gyr_x, gyr_y, gyr_z))
-
-            # Read magnetometer
-            mag_x = self.imu.readMAGx()
-            mag_y = self.imu.readMAGy()
-            mag_z = self.imu.readMAGz()
-            self.mag_char.set_value(self._pack_sensor_values(mag_x, mag_y, mag_z))
-
-        except Exception as e:
-            self.logger.error(f"Error updating sensor values: {e}")
-
-    def start(self):
-        """Start the peripheral and begin broadcasting sensor data"""
-        try:
-            # Set device name
-            self.dongle.alias = 'IMU_Sensor'
-
-            # Start BLE application
-            self.running = True
-
-            self.logger.info("Starting IMU peripheral...")
-
-            # Start update loop in the main thread
-            while self.running:
-                self.update_sensor_values()
-                time.sleep(self.update_rate)
-
-        except Exception as e:
-            self.logger.error(f"Error in peripheral operation: {e}")
-        finally:
-            self.stop()
-
-    def stop(self):
-        """Stop the peripheral"""
-        self.running = False
-        self.app.stop()
-
-
-if __name__ == '__main__':
-    try:
-        peripheral = IMUPeripheral()
-        peripheral.start()
-    except KeyboardInterrupt:
-        print("\nStopping IMU Peripheral...")
-    except Exception as e:
-        print(f"Error: {e}")
+    def disconnect(self):
+        """Disconnect from the peripheral."""
+        print(f"Disconnecting from device {self.rmt_device.address}...")
+        self.rmt_device.disconnect()
+        print("Disconnected.")
