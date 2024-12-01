@@ -1,3 +1,37 @@
+"""
+
+##Setup
+
+sudo nano /lib/systemd/system/bluetooth.service
+ExecStart=/usr/libexec/bluetooth/bluetoothd --experimental
+
+sudo systemctl daemon-reload
+sudo systemctl restart bluetooth
+
+sudo usermod -aG bluetooth $USER
+
+sudo nano /etc/bluetooth/main.conf
+AutoEnable=true
+
+sudo hciconfig hci0 piscan
+
+bluetoothctl
+power on
+discoverable-timeout 0
+discoverable on
+pairable on
+
+source ~/ble_venv/bin/activate
+python3 ~/ble_imu/ble_peripheral.py
+
+## Troubleshooting
+sudo systemctl restart bluetooth
+journalctl -u bluetooth.service
+bluetoothctl
+scan on
+hciconfig hci0
+
+"""
 from IMU import IMUSensor
 from bluezero import adapter
 from bluezero import advertisement
