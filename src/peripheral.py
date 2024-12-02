@@ -1,219 +1,196 @@
 """
+BLE Peripheral Implementation for IMU Data Transmission
 
-##Setup
-
-sudo nano /lib/systemd/system/bluetooth.service
-ExecStart=/usr/libexec/bluetooth/bluetoothd --experimental
-
-sudo systemctl daemon-reload
-sudo systemctl restart bluetooth
-
-sudo usermod -aG bluetooth $USER
-
-sudo nano /etc/bluetooth/main.conf
-AutoEnable=true
-
-sudo hciconfig hci0 piscan
-
-bluetoothctl
-power on
-discoverable-timeout 0
-discoverable on
-pairable on
-
-source ~/ble_venv/bin/activate
-python3 ~/ble_imu/ble_peripheral.py
-
-## Troubleshooting
-sudo systemctl restart bluetooth
-journalctl -u bluetooth.service
-bluetoothctl
-scan on
-hciconfig hci0
-
+This module implements a BLE peripheral that broadcasts IMU sensor data.
+It handles automatic advertising, characteristic updates, and proper resource cleanup.
 """
-from peripheral_class import Peripheral
-from IMU import IMUSensor
-from bluezero import adapter
-from bluezero import advertisement
-from bluezero import async_tools
-from bluezero import tools
+
+import asyncio
+import logging
+from typing import Optional, Dict, Any
+from dataclasses import dataclass
 import struct
 import time
-import logging
+from contextlib import contextmanager
+
+from bluezero import adapter, advertisement, tools, localGATT
 import dbus
 import dbus.mainloop.glib
+from dbus.mainloop.glib import DBusGMainLoop
+
+from IMU import IMUSensor
 
 # Initialize dbus mainloop
-dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+DBusGMainLoop(set_as_default=True)
+
+
+@dataclass
+class IMUService:
+    """Configuration for IMU BLE service"""
+    SERVICE_UUID = "1b9998a2-1234-5678-1234-56789abcdef0"
+    ACCEL_CHAR_UUID = "2713d05a-1234-5678-1234-56789abcdef1"
+    GYRO_CHAR_UUID = "2713d05b-1234-5678-1234-56789abcdef2"
+    MAG_CHAR_UUID = "2713d05c-1234-5678-1234-56789abcdef3"
 
 
 class IMUAdvertisement(advertisement.Advertisement):
-    """Custom Advertisement with stronger parameters"""
+    """Enhanced BLE advertisement for IMU peripheral"""
 
-    def __init__(self, device_name):
-        super().__init__(0, 'peripheral')  # Use instance 0
+    def __init__(self, device_name: str):
+        """
+        Initialize advertisement with device name and service UUID.
+
+        Args:
+            device_name: Name to advertise for the device
+        """
+        super().__init__(0, 'peripheral')
         self.local_name = device_name
         self.include_tx_power = True
-        # Add manufacturer data using the correct method
-        self.manufacturer_data(0xFFFF, [0x01, 0x02])  # Company ID and data
+        self.service_UUIDs = [IMUService.SERVICE_UUID]
+        self.manufacturer_data = {
+            0xFFFF: [0x01, 0x02]  # Company ID and data
+        }
 
 
 class IMUPeripheral:
-    """BLE Peripheral that broadcasts IMU sensor data"""
+    """BLE Peripheral for broadcasting IMU sensor data"""
 
-    IMU_SERVICE_UUID = '1b9998a2-1234-5678-1234-56789abcdef0'
-    ACCEL_CHAR_UUID = '2713d05a-1234-5678-1234-56789abcdef1'
-    GYRO_CHAR_UUID = '2713d05b-1234-5678-1234-56789abcdef2'
-    MAG_CHAR_UUID = '2713d05c-1234-5678-1234-56789abcdef3'
+    def __init__(
+            self,
+            adapter_addr: Optional[str] = None,
+            device_name: str = "IMU_Sensor",
+            update_interval: float = 0.1
+    ):
+        """
+        Initialize IMU peripheral.
 
-    def __init__(self, adapter_addr=None, update_rate=0.1):
+        Args:
+            adapter_addr: Optional specific adapter address
+            device_name: Name to advertise for the device
+            update_interval: Interval between sensor updates in seconds
+        """
         self.logger = logging.getLogger(__name__)
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format='%(asctime)s - %(levelname)s - %(message)s'
-        )
+        logging.basicConfig(level=logging.INFO)
 
-        self.logger.info("Initializing IMU Peripheral...")
+        # Initialize state
+        self.running = False
+        self.update_interval = update_interval
 
-        # Get adapter address and check status
-        if adapter_addr is None:
-            adapters = list(adapter.Adapter.available())
-            if len(adapters) > 0:
-                adapter_addr = adapters[0].address
-                self.logger.info(f"Found adapter: {adapter_addr}")
-            else:
-                raise RuntimeError("No Bluetooth adapters found")
-
-        # Initialize adapter directly first
-        self.dongle = adapter.Adapter(adapter_addr)
-        self.logger.info(f"Adapter powered: {self.dongle.powered}")
-        self.logger.info(f"Adapter discoverable: {self.dongle.discoverable}")
-
-        # Power cycle the adapter
-        self.logger.info("Power cycling adapter...")
-        self.dongle.powered = False
-        time.sleep(1)
-        self.dongle.powered = True
-        time.sleep(1)
-
-        # Set adapter properties
-        self.dongle.discoverable = True
-        self.dongle.pairable = True
-
-        # Initialize peripheral
-        self.peripheral = Peripheral(adapter_addr, local_name='IMU_Sensor')
-
-        # Create advertisement and manager
-        self.advertisement = IMUAdvertisement('IMU_Sensor')
-        self.advertisement.service_UUIDs = [self.IMU_SERVICE_UUID]
-        self.ad_manager = advertisement.AdvertisingManager(adapter_addr)
+        # Initialize adapter
+        self.adapter = adapter.Adapter(adapter_addr)
+        self._ensure_adapter_config()
 
         # Initialize IMU
         self.imu = IMUSensor()
+        self._init_imu()
+
+        # Initialize BLE components
+        self.app = localGATT.Application()
+        self.advertisement = IMUAdvertisement(device_name)
+        self.ad_manager = advertisement.AdvertisingManager(self.adapter.address)
+
+        # Set up GATT server
+        self._setup_gatt_server()
+
+    def _ensure_adapter_config(self):
+        """Ensure adapter is properly configured"""
+        if not self.adapter.powered:
+            self.adapter.powered = True
+            time.sleep(1)  # Wait for power up
+
+        self.adapter.discoverable = True
+        self.adapter.pairable = True
+
+    def _init_imu(self):
+        """Initialize and verify IMU sensor"""
         imu_version = self.imu.detectIMU()
         if imu_version == 99:
             raise RuntimeError("No IMU detected")
+
         self.logger.info(f"Detected IMU version: {imu_version}")
-        self.imu.initIMU()
-
-        # Setup services and characteristics
-        self._setup_gatt_server()
-
-        self.update_rate = update_rate
-        self.running = True
+        if not self.imu.initIMU():
+            raise RuntimeError("Failed to initialize IMU")
 
     def _setup_gatt_server(self):
-        """Setup GATT services and characteristics"""
-        self.logger.debug("Setting up GATT server...")
-
-        # Add IMU service
-        self.peripheral.add_service(
-            srv_id=1,
-            uuid=self.IMU_SERVICE_UUID,
-            primary=True
+        """Set up GATT server with IMU characteristics"""
+        # Create IMU service
+        service = localGATT.Service(
+            1,  # service ID
+            IMUService.SERVICE_UUID,
+            True  # primary service
         )
-        self.logger.debug("Added IMU service")
+        self.app.add_managed_object(service)
 
-        # Add characteristics with more descriptive UUIDs
-        self.peripheral.add_characteristic(
-            srv_id=1,
-            chr_id=1,
-            uuid=self.ACCEL_CHAR_UUID,
-            value=[0] * 6,
-            notifying=True,
-            flags=['read', 'notify'],
-            read_callback=self._read_accelerometer
+        # Add characteristics
+        self._add_characteristic(
+            service, 1, IMUService.ACCEL_CHAR_UUID, self._read_accelerometer
+        )
+        self._add_characteristic(
+            service, 2, IMUService.GYRO_CHAR_UUID, self._read_gyroscope
+        )
+        self._add_characteristic(
+            service, 3, IMUService.MAG_CHAR_UUID, self._read_magnetometer
         )
 
-        self.peripheral.add_characteristic(
-            srv_id=1,
-            chr_id=2,
-            uuid=self.GYRO_CHAR_UUID,
-            value=[0] * 6,
-            notifying=True,
-            flags=['read', 'notify'],
-            read_callback=self._read_gyroscope
+    def _add_characteristic(self, service: localGATT.Service, char_id: int, uuid: str, read_cb):
+        """Helper to add a characteristic to the service"""
+        char = localGATT.Characteristic(
+            service.get_path(),
+            char_id,
+            uuid,
+            ['read', 'notify'],
+            read_cb
         )
 
-        self.peripheral.add_characteristic(
-            srv_id=1,
-            chr_id=3,
-            uuid=self.MAG_CHAR_UUID,
-            value=[0] * 6,
-            notifying=True,
-            flags=['read', 'notify'],
-            read_callback=self._read_magnetometer
-        )
+        self.app.add_managed_object(char)
+        return char
 
-    def _read_accelerometer(self):
+    def _read_accelerometer(self) -> bytes:
         """Callback for reading accelerometer values"""
         x = self.imu.readACCx()
         y = self.imu.readACCy()
         z = self.imu.readACCz()
         self.logger.debug(f"ACC: X={x}, Y={y}, Z={z}")
-        return list(struct.pack('<hhh', int(x), int(y), int(z)))
+        return struct.pack('<hhh', int(x), int(y), int(z))
 
-    def _read_gyroscope(self):
+    def _read_gyroscope(self) -> bytes:
         """Callback for reading gyroscope values"""
         x = self.imu.readGYRx()
         y = self.imu.readGYRy()
         z = self.imu.readGYRz()
         self.logger.debug(f"GYR: X={x}, Y={y}, Z={z}")
-        return list(struct.pack('<hhh', int(x), int(y), int(z)))
+        return struct.pack('<hhh', int(x), int(y), int(z))
 
-    def _read_magnetometer(self):
+    def _read_magnetometer(self) -> bytes:
         """Callback for reading magnetometer values"""
         x = self.imu.readMAGx()
         y = self.imu.readMAGy()
         z = self.imu.readMAGz()
         self.logger.debug(f"MAG: X={x}, Y={y}, Z={z}")
-        return list(struct.pack('<hhh', int(x), int(y), int(z)))
+        return struct.pack('<hhh', int(x), int(y), int(z))
+
+    @contextmanager
+    def advertising(self):
+        """Context manager for handling advertisement"""
+        try:
+            self.ad_manager.register_advertisement(self.advertisement, {})
+            yield
+        finally:
+            self.ad_manager.unregister_advertisement(self.advertisement)
 
     def start(self):
         """Start the peripheral"""
         try:
             self.logger.info("Starting IMU peripheral...")
+            self._ensure_adapter_config()
 
-            # Double check adapter status before starting
-            self.logger.info(f"Final adapter status:")
-            self.logger.info(f"  - Powered: {self.dongle.powered}")
-            self.logger.info(f"  - Discoverable: {self.dongle.discoverable}")
-            self.logger.info(f"  - Pairable: {self.dongle.pairable}")
-            self.logger.info(f"  - Address: {self.dongle.address}")
-
-            # Register advertisement
-            self.logger.info("Registering advertisement...")
-            self.ad_manager.register_advertisement(self.advertisement, {})
-
-            # Start the peripheral
-            self.logger.info("Publishing peripheral...")
-            self.peripheral.publish()
-
-            self.logger.info("IMU peripheral started successfully")
+            with self.advertising():
+                self.running = True
+                self.app.run()  # Start GATT server
 
         except Exception as e:
             self.logger.error(f"Error starting peripheral: {e}", exc_info=True)
+            self.running = False
             raise
 
     def stop(self):
@@ -221,13 +198,42 @@ class IMUPeripheral:
         try:
             self.logger.info("Stopping IMU peripheral...")
             self.running = False
-            self.ad_manager.unregister_advertisement(self.advertisement)
-            self.dongle.discoverable = False
+            self.app.quit()
+            self.adapter.discoverable = False
+            self.logger.info("IMU peripheral stopped")
+
         except Exception as e:
             self.logger.error(f"Error stopping peripheral: {e}")
+            raise
 
 
-if __name__ == '__main__':
+class AsyncIMUPeripheral(IMUPeripheral):
+    """Asynchronous version of IMU Peripheral"""
+
+    async def start_async(self):
+        """Start the peripheral asynchronously"""
+        try:
+            self.logger.info("Starting IMU peripheral (async)...")
+            self._ensure_adapter_config()
+
+            with self.advertising():
+                self.running = True
+                # Convert synchronous app.run() to async
+                while self.running:
+                    await asyncio.sleep(self.update_interval)
+
+        except Exception as e:
+            self.logger.error(f"Error starting peripheral: {e}", exc_info=True)
+            self.running = False
+            raise
+
+    async def stop_async(self):
+        """Stop the peripheral asynchronously"""
+        await asyncio.get_event_loop().run_in_executor(None, self.stop)
+
+
+def main():
+    """Main function to run the peripheral"""
     try:
         peripheral = IMUPeripheral()
         peripheral.start()
@@ -237,3 +243,25 @@ if __name__ == '__main__':
             peripheral.stop()
     except Exception as e:
         print(f"Fatal error: {e}")
+
+
+async def main_async():
+    """Async main function to run the peripheral"""
+    try:
+        peripheral = AsyncIMUPeripheral()
+        await peripheral.start_async()
+    except KeyboardInterrupt:
+        print("\nStopping IMU Peripheral...")
+        if 'peripheral' in locals():
+            await peripheral.stop_async()
+    except Exception as e:
+        print(f"Fatal error: {e}")
+
+
+if __name__ == "__main__":
+    import sys
+
+    if "--async" in sys.argv:
+        asyncio.run(main_async())
+    else:
+        main()

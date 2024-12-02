@@ -28,8 +28,8 @@ A Bluetooth Low Energy (BLE) system for collecting and transmitting IMU (Inertia
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/ble-imu
-cd ble-imu
+git clone https://github.com/codegitgubka/ble_pi_4
+cd ble_pi_4
 ```
 
 2. Create and activate a virtual environment:
@@ -73,8 +73,8 @@ project_root/
 ├── requirements.txt
 ├── README.md
 ├── src/
-│   ├── __init__.py
-│   ├── ble_central.py
+│   ├── localGATT.py
+│   ├── central.py
 │   ├── peripheral.py
 │   └── IMU.py
 └── tests/
@@ -96,7 +96,7 @@ peripheral.start()
 ### Using the Synchronous Central
 
 ```python
-from src.ble_central import BLECentral
+from src.central import BLECentral
 
 central = BLECentral(
     device_addr="XX:XX:XX:XX:XX:XX",  # Replace with your peripheral's address
@@ -118,7 +118,7 @@ with central.connection():
 
 ```python
 import asyncio
-from src.ble_central import AsyncBLECentral
+from src.central import AsyncBLECentral
 
 async def main():
     central = AsyncBLECentral(
