@@ -1,295 +1,119 @@
-"""
-BLE Central Implementation for IMU Data Collection
-
-This module provides both synchronous and asynchronous implementations for a BLE Central
-node that collects IMU sensor data from a peripheral device.
-"""
-
-import asyncio
 import logging
-import time
-from typing import Dict, Optional, Tuple
-from dataclasses import dataclass
-from collections import deque
-from contextlib import asynccontextmanager, contextmanager
-
+from time import sleep
 from bluezero import adapter, device, GATT, tools
 
+# UUIDs from your peripheral script
+IMU_SERVICE_UUID = '1b9998a2-1234-5678-1234-56789abcdef0'
+ACCEL_CHAR_UUID = '2713d05a-1234-5678-1234-56789abcdef1'
+GYRO_CHAR_UUID = '2713d05b-1234-5678-1234-56789abcdef2'
+MAG_CHAR_UUID = '2713d05c-1234-5678-1234-56789abcdef3'
 
-@dataclass
-class IMUCharacteristics:
-    """Storage for IMU BLE characteristics"""
-    accel: GATT.Characteristic
-    gyro: GATT.Characteristic
-    mag: GATT.Characteristic
+# Set up logging
+logger = tools.create_module_logger(__name__)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 
-class BLECentral:
-    """Base BLE Central implementation with core functionality"""
+class Central:
+    """Create a BLE instance taking the Central role."""
 
-    def __init__(
-            self,
-            device_addr: str,
-            service_uuid: str,
-            char_uuids: Dict[str, str],
-            adapter_addr: Optional[str] = None,
-            max_retries: int = 3,
-            retry_delay: float = 2.0
-    ):
+    def __init__(self, device_addr, adapter_addr=None):
+        # Initialize adapter
+        if adapter_addr is None:
+            self.dongle = adapter.Adapter()
+            logger.debug("Adapter is: %s", self.dongle.address)
+        else:
+            self.dongle = adapter.Adapter(adapter_addr)
+
+        # Ensure the adapter is powered
+        if not self.dongle.powered:
+            self.dongle.powered = True
+            logger.info("Adapter was off, now powered on")
+
+        # Connect to the remote device
+        self.rmt_device = device.Device(self.dongle.address, device_addr)
+        self._characteristics = []
+
+    def add_characteristic(self, srv_uuid, chrc_uuid):
         """
-        Initialize BLE Central.
+        Specify a characteristic of interest on the remote device.
 
-        Args:
-            device_addr: MAC address of target peripheral
-            service_uuid: UUID of the IMU service
-            char_uuids: Dictionary of characteristic UUIDs for each sensor
-            adapter_addr: Optional specific adapter address
-            max_retries: Maximum connection retry attempts
-            retry_delay: Delay between retries in seconds
+        :param srv_uuid: 128-bit UUID
+        :param chrc_uuid: 128-bit UUID
         """
-        self.logger = logging.getLogger(__name__)
+        chrc_hndl = GATT.Characteristic(self.dongle.address,
+                                        self.rmt_device.address,
+                                        srv_uuid,
+                                        chrc_uuid)
+        self._characteristics.append(chrc_hndl)
+        return chrc_hndl
 
-        # Store configuration
-        self.device_addr = device_addr
-        self.service_uuid = service_uuid
-        self.char_uuids = char_uuids
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-
-        # Initialize state
-        self.connected = False
-        self._characteristics = None
-
-        # Setup adapter
-        self.adapter = adapter.Adapter(adapter_addr)
-        if not self.adapter.powered:
-            self.adapter.powered = True
-
-        # Setup device
-        self.device = device.Device(self.adapter.address, device_addr)
-
-    def connect(self) -> bool:
+    def load_gatt(self):
         """
-        Establish connection to peripheral.
-
-        Returns:
-            bool: True if connection successful
+        Once connected to the remote device, load the GATT database.
         """
-        if self.connected:
-            return True
+        for chrc in self._characteristics:
+            available = chrc.resolve_gatt()
+            if available:
+                logger.info("Service: %s, Characteristic: %s added",
+                            chrc.srv_uuid, chrc.chrc_uuid)
+            else:
+                logger.warning("Service: %s, Characteristic: %s not available on device: %s",
+                               chrc.srv_uuid, chrc.chrc_uuid, chrc.device_addr)
 
-        try:
-            self.logger.info(f"Connecting to {self.device_addr}...")
-            self.device.connect()
+    def connect(self, timeout=35):
+        """
+        Initiate connection to the remote device.
 
-            # Wait for service discovery
-            retry = 30
-            while not self.device.services_resolved and retry > 0:
-                retry -= 1
-                time.sleep(0.5)
+        :param timeout: (optional) seconds to wait for connection.
+        """
+        logger.info("Connecting to device...")
+        self.rmt_device.connect(timeout=timeout)
 
-            if not self.device.services_resolved:
-                raise TimeoutError("Service discovery timed out")
+        while not self.rmt_device.services_resolved:
+            logger.info("Waiting for services to resolve...")
+            sleep(1)
 
-            self._load_characteristics()
-            self.connected = True
-            self.logger.info("Connected successfully")
-            return True
+        logger.info("Device connected. Services resolved.")
+        self.load_gatt()
 
-        except Exception as e:
-            self.logger.error(f"Connection failed: {e}")
-            self.connected = False
-            return False
+    def read_characteristics(self):
+        """
+        Read values from characteristics (e.g., accelerometer, gyroscope, magnetometer).
+        """
+        for chrc in self._characteristics:
+            value = chrc.read_value()
+            logger.info("Characteristic %s value: %s", chrc.chrc_uuid, value)
 
     def disconnect(self):
-        """Disconnect from peripheral"""
-        if self.connected:
-            try:
-                self.device.disconnect()
-            except Exception as e:
-                self.logger.error(f"Error during disconnect: {e}")
-            finally:
-                self.connected = False
-                self._characteristics = None
-
-    def _load_characteristics(self):
-        """Load BLE characteristics"""
-        try:
-            characteristics = {}
-            for name, uuid in self.char_uuids.items():
-                char = GATT.Characteristic(
-                    adapter_addr=self.adapter.address,
-                    device_addr=self.device_addr,
-                    srv_uuid=self.service_uuid,
-                    chrc_uuid=uuid
-                )
-                if not char.resolve_gatt():
-                    raise RuntimeError(f"Failed to resolve {name} characteristic")
-                characteristics[name] = char
-
-            self._characteristics = IMUCharacteristics(**characteristics)
-
-        except Exception as e:
-            self.logger.error(f"Error loading characteristics: {e}")
-            raise
-
-    def read_imu_data(self, sensor_type: str) -> Optional[Tuple[int, int, int]]:
-        """
-        Read IMU sensor data.
-
-        Args:
-            sensor_type: Type of sensor to read ('accel', 'gyro', 'mag')
-
-        Returns:
-            Optional[Tuple[int, int, int]]: Sensor values or None if read fails
-        """
-        if not self.connected or not self._characteristics:
-            if not self.connect():
-                return None
-
-        try:
-            char = getattr(self._characteristics, sensor_type)
-            raw_data = char.read_value()
-            return tools.bytes_to_xyz(raw_data)
-        except Exception as e:
-            self.logger.error(f"Error reading {sensor_type} data: {e}")
-            self.connected = False
-            return None
-
-    @contextmanager
-    def connection(self):
-        """Context manager for handling connections"""
-        try:
-            self.connect()
-            yield self
-        finally:
-            self.disconnect()
+        """Disconnect from the remote device."""
+        logger.info("Disconnecting from device...")
+        self.rmt_device.disconnect()
+        logger.info("Device disconnected.")
 
 
-class AsyncBLECentral(BLECentral):
-    """Asynchronous BLE Central implementation"""
+if __name__ == '__main__':
+    # Replace this with the Bluetooth address of your peripheral
+    DEVICE_ADDRESS = "D8:3A:DD:EB:EE:63"  # Example address
 
-    async def connect_async(self) -> bool:
-        """
-        Establish connection asynchronously.
+    try:
+        # Initialize central device
+        central = Central(DEVICE_ADDRESS)
 
-        Returns:
-            bool: True if connection successful
-        """
-        if self.connected:
-            return True
+        # Add IMU characteristics
+        central.add_characteristic(IMU_SERVICE_UUID, ACCEL_CHAR_UUID)
+        central.add_characteristic(IMU_SERVICE_UUID, GYRO_CHAR_UUID)
+        central.add_characteristic(IMU_SERVICE_UUID, MAG_CHAR_UUID)
 
-        try:
-            self.logger.info(f"Connecting to {self.device_addr}...")
+        # Connect and read values
+        central.connect()
+        central.read_characteristics()
 
-            # Run blocking connect in executor
-            await asyncio.get_event_loop().run_in_executor(
-                None, self.device.connect
-            )
-
-            # Wait for service discovery
-            retry = 30
-            while not self.device.services_resolved and retry > 0:
-                retry -= 1
-                await asyncio.sleep(0.5)
-
-            if not self.device.services_resolved:
-                raise TimeoutError("Service discovery timed out")
-
-            self._load_characteristics()
-            self.connected = True
-            self.logger.info("Connected successfully")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Connection failed: {e}")
-            self.connected = False
-            return False
-
-    async def disconnect_async(self):
-        """Disconnect asynchronously"""
-        if self.connected:
-            try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None, self.device.disconnect
-                )
-            except Exception as e:
-                self.logger.error(f"Error during disconnect: {e}")
-            finally:
-                self.connected = False
-                self._characteristics = None
-
-    async def read_imu_data_async(self, sensor_type: str) -> Optional[Tuple[int, int, int]]:
-        """
-        Read IMU sensor data asynchronously.
-
-        Args:
-            sensor_type: Type of sensor to read ('accel', 'gyro', 'mag')
-
-        Returns:
-            Optional[Tuple[int, int, int]]: Sensor values or None if read fails
-        """
-        if not self.connected or not self._characteristics:
-            if not await self.connect_async():
-                return None
-
-        try:
-            char = getattr(self._characteristics, sensor_type)
-            raw_data = await asyncio.get_event_loop().run_in_executor(
-                None, char.read_value
-            )
-            return tools.bytes_to_xyz(raw_data)
-        except Exception as e:
-            self.logger.error(f"Error reading {sensor_type} data: {e}")
-            self.connected = False
-            return None
-
-    @asynccontextmanager
-    async def connection(self):
-        """Async context manager for handling connections"""
-        try:
-            await self.connect_async()
-            yield self
-        finally:
-            await self.disconnect_async()
-
-
-# Example usage:
-def sync_example():
-    central = BLECentral(
-        device_addr="XX:XX:XX:XX:XX:XX",
-        service_uuid="1b9998a2-1234-5678-1234-56789abcdef0",
-        char_uuids={
-            'accel': '2713d05a-1234-5678-1234-56789abcdef1',
-            'gyro': '2713d05b-1234-5678-1234-56789abcdef2',
-            'mag': '2713d05c-1234-5678-1234-56789abcdef3'
-        }
-    )
-
-    with central.connection():
-        accel_data = central.read_imu_data('accel')
-        print(f"Accelerometer data: {accel_data}")
-
-
-async def async_example():
-    central = AsyncBLECentral(
-        device_addr="XX:XX:XX:XX:XX:XX",
-        service_uuid="1b9998a2-1234-5678-1234-56789abcdef0",
-        char_uuids={
-            'accel': '2713d05a-1234-5678-1234-56789abcdef1',
-            'gyro': '2713d05b-1234-5678-1234-56789abcdef2',
-            'mag': '2713d05c-1234-5678-1234-56789abcdef3'
-        }
-    )
-
-    async with central.connection():
-        accel_data = await central.read_imu_data_async('accel')
-        print(f"Accelerometer data: {accel_data}")
-
-
-if __name__ == "__main__":
-    # Run sync example
-    sync_example()
-
-    # Run async example
-    asyncio.run(async_example())
+    except KeyboardInterrupt:
+        logger.info("Terminating connection...")
+        if 'central' in locals():
+            central.disconnect()
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
