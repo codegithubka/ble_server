@@ -109,6 +109,7 @@ class IMUPeripheral:
             self.ad_manager.register_advertisement(self.advertisement, {})
             logger.info("Advertisement registered successfully")
             self.peripheral.publish()
+            time.sleep(10)
             logger.info("Peripheral published and running")
         except Exception as e:
             logger.error(f"Failed to start IMU Peripheral: {e}")
